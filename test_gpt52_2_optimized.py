@@ -17,8 +17,8 @@ MODEL_PROVIDERS = {
         "models": ["gpt-4o", "gpt-4o-mini", "o1-mini"]
     },
     "Baidu ERNIE": {
-        "base_url": "https://qianfan.baidubce.com/v2",
-        "api_key": "bce-v3/ALTAK-IlAGWrpPIFAMJ3g8kbD4I/f17c0a909b891c89b0dce53d913448d86a87bad9",
+        "base_url": os.getenv("BAIDU_BASE_URL", "https://qianfan.baidubce.com/v2"),
+        "api_key": os.getenv("BAIDU_API_KEY"),
         "models": ["ernie-4.5-turbo-32k",]
     }
 }
@@ -677,7 +677,26 @@ def get_current_client_info():
     provider = st.session_state.get("selected_provider", "OpenAI")
     model = st.session_state.get("selected_model", "gpt-4o-mini")
     config = MODEL_PROVIDERS.get(provider, MODEL_PROVIDERS["OpenAI"])
-    return config["api_key"], config["base_url"], model
+
+    # 优先使用环境变量，其次使用 Streamlit secrets
+    api_key = config.get("api_key")
+    base_url = config.get("base_url")
+
+    try:
+        secrets = st.secrets if hasattr(st, "secrets") else {}
+    except Exception:
+        secrets = {}
+
+    if not api_key:
+        if provider == "OpenAI":
+            api_key = os.getenv("OPENAI_API_KEY") or secrets.get("OPENAI_API_KEY")
+        else:  # Baidu ERNIE
+            api_key = os.getenv("BAIDU_API_KEY") or secrets.get("BAIDU_API_KEY")
+
+    if not base_url and provider != "OpenAI":
+        base_url = os.getenv("BAIDU_BASE_URL") or (secrets.get("BAIDU_BASE_URL") if secrets else None) or "https://qianfan.baidubce.com/v2"
+
+    return api_key, base_url, model
 
 def call_llm_text(system: str, user: str, temperature: float = 0.2) -> str:
     api_key, base_url, model = get_current_client_info()

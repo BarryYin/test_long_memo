@@ -632,6 +632,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1  # 可选
   "amount": "Rp 1.250.000",
   "due_date": "2025-12-17",
   "current_time": "2025-12-17",
+  "DPD": 0,
   "gender": "Male",
   "age": "30",
   "frenquency_borrow": "often",          // 借款频率
@@ -639,6 +640,9 @@ OPENAI_BASE_URL=https://api.openai.com/v1  # 可选
   "meaber_level": "high"                  // 会员等级
 }
 ```
+
+说明：
+- `DPD`（Days Past Due）：系统在初始化时根据 `current_time - due_date` 自动计算并写入；当 `DPD≥0` 时，系统会在侧边栏显示强提醒，要求“当天闭环还款”（今天必须落实：全额，或部分+今天具体时间点，或符合条件的当天展期）。
 
 ### 历史记录格式
 

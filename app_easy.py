@@ -339,26 +339,35 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 def call_llm(prompt, system_prompt="You are a helpful assistant.", json_mode=False):
-    try:
-        kwargs = {
-            "model": MODEL_NAME,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7
-        }
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-            
-        log(f"Calling LLM... Model: {MODEL_NAME}, JSON_Mode: {json_mode}")
-        response = client.chat.completions.create(**kwargs)
-        log("LLM Response received.")
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        log(f"LLM Error: {e}")
-        st.error(f"LLM Error: {e}")
-        return "Error"
+    """调用 LLM，带简单重试和 JSON 模式支持。"""
+    retries = 2
+    for attempt in range(retries + 1):
+        try:
+            kwargs = {
+                "model": MODEL_NAME,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.7
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            log(f"Calling LLM... Model: {MODEL_NAME}, JSON_Mode: {json_mode}")
+            response = client.chat.completions.create(**kwargs)
+            log("LLM Response received.")
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            log(f"LLM Error: {e}")
+            if attempt < retries:
+                # 简单指数退避
+                wait_s = 1.5 ** attempt
+                log(f"Retrying LLM in {wait_s:.1f}s (attempt {attempt+1}/{retries})...")
+                import time
+                time.sleep(wait_s)
+                continue
+            st.error(f"LLM Error: {e}")
+            return "Error"
 
 # --- Agent Layers (Adapted for Streamlit) ---
 
@@ -388,25 +397,8 @@ class Layer1StrategyManager:
         【今日临时催收策略】
         1. 沟通基调：...
         2. 重点强调的内容：...
-        
-        【多步收敛路径】（核心：逐步收敛关键信息）
         step0: 查阅聊天历史，延续上次的聊天，询问客户之前阻碍还款的因素是否已经消除，今天是否有计划还钱
-        Step1: 确认还款能力 - 追问客户当前是否有钱可还（是/否）
-        Step2: 确认还款时间 - 如果有能力，追问具体哪天还（明确日期）
-        Step3: 确认还款金额 - 追问能还多少（全额 ¥{customer_profile.get('amount_due', 0)} 还是部分）
-        Step4: 确认付款方式 - 如果是部分还款，追问剩余如何处理（展期/分期）
-        Step5: 锁定承诺 - 让客户明确承诺上述信息，记录为正式还款计划
-        Step6: 如果客户说不能还钱，要问清楚客户不还钱的原因是什么？
-        step7: 如果客户坚持今天不能还钱，开始施加压力给到客户，逐步提升。
-          - 客户还钱，会获得好的信用，提升会员等级；
-          - 会提升贷款额度和笔数；会获得还款折扣；
-          - 会影响信用分，降低贷款额度；
-          - 后续贷款会很困难，我们会停掉与客户的合作；
-          - 拉入黑名单，客户的贷款行为受限，不只是在我们这不能借款，在哪里都不能借款。
-          - 与紧急联系人沟通，让他协助还款
-          - 联系你工作的单位，与你的领导进行沟通，了解你的经济状况
-          - 在社交媒体上与你进行沟通，需要让你知道我们可以在社交媒体上找打你
-          - 安排第三方上门进行催收
+       
         
         ⚠️ 注意：每一步都要等客户明确回答后再进入下一步，不要一次问太多问题。
         """
@@ -438,10 +430,25 @@ Layer 3 评估与建议（包含收敛性分析）：
 2. 如果信息收敛进度慢（如"3轮对话仅收集到1个信息"），需要在策略中明确强调"追问未确认的信息"
 3. 如果某些关键信息（如时间、金额）一直未收集到，在【多步收敛路径】中优先追问
 
-抓住客户的借款需求，制定有说服力的策略，比如客户是长期高频借贷者，它会担心信用缺失。
+        【多步收敛路径】（核心：逐步收敛关键信息）
+        step0: 查阅聊天历史，延续上次的聊天，询问客户之前阻碍还款的因素是否已经消除，今天是否有计划还钱
+        Step1: 确认还款能力 - 追问客户当前是否有钱可还（是/否）
+        Step2: 确认还款时间 - 如果有能力，追问具体哪天还（明确日期）
+        Step3: 确认还款金额 - 追问能还多少（全额 ¥{customer_profile.get('amount_due', 0)} 还是部分）
+        Step4: 确认付款方式 - 如果是部分还款，追问剩余如何处理（展期/分期）
+        Step5: 锁定承诺 - 让客户明确承诺上述信息，记录为正式还款计划
+        Step6: 如果客户说不能还钱，要问清楚客户不还钱的原因是什么？
+        step7: 如果客户坚持今天不能还钱，开始施加压力给到客户，逐步提升。
+          - 客户还钱，会获得好的信用，提升会员等级；
+          - 会提升贷款额度和笔数；会获得还款折扣；
+          - 会影响信用分，降低贷款额度；
+          - 后续贷款会很困难，我们会停掉与客户的合作；
+          - 拉入黑名单，客户的贷款行为受限，不只是在我们这不能借款，在哪里都不能借款。
+          - 与紧急联系人沟通，让他协助还款
+          - 联系你工作的单位，与你的领导进行沟通，了解你的经济状况
+          - 在社交媒体上与你进行沟通，需要让你知道我们可以在社交媒体上找打你
+          - 安排第三方上门进行催收
 
-如果客户是初次借贷，或者低频借贷者，这个时候可以适当的给些压力，比如你如果一直不配合我们，我们会与紧急联系人沟通
-        
 请直接输出修改后的新策略，必须包含：
 【今日临时催收策略】
 1. 沟通基调：...（根据 Layer 3 的评估调整）
@@ -472,6 +479,10 @@ class Layer2Executor:
         if "Output Format" in cleaned_base_prompt:
             cleaned_base_prompt = cleaned_base_prompt.replace("Output Format", "")
         
+        # 限制历史消息长度，避免上下文过长导致失败
+        max_history = self.config.get('max_history_messages', 10)
+        trimmed_history = chat_history[-max_history:] if isinstance(chat_history, list) else []
+
         combined_system_prompt = f"""{cleaned_base_prompt}
 
 # KEY CONTEXT (Read Carefully)
@@ -503,6 +514,9 @@ You are a professional Collection Agent - focused on **execution**, not analysis
 - Be natural - don't sound like a robot reading a script
 - If strategy says "Step2: 确认还款时间" and time is missing (⏳), ask about time
 
+**DPD RULE**:
+- If the client is past due (DPD≥0), enforce same-day closure: secure either full payment, or partial payment plus a specific time TODAY, or a same-day extension if eligible.
+
 **TONE ADJUSTMENT**:
 - If intent=1 (client willing to pay today): be helpful, supportive, collaborative
 - If intent=0 (client unwilling): increase pressure, use warnings, be firm
@@ -520,7 +534,7 @@ You MUST respond with VALID JSON containing these exact fields:
 IMPORTANT: Output ONLY valid JSON. No markdown code blocks, no explanation text before or after JSON."""
         
         messages = [{"role": "system", "content": combined_system_prompt}]
-        for msg in chat_history:
+        for msg in trimmed_history:
             messages.append({"role": msg['role'], "content": msg['content']})
         messages.append({"role": "user", "content": user_input})
         
@@ -534,9 +548,20 @@ IMPORTANT: Output ONLY valid JSON. No markdown code blocks, no explanation text 
             )
             log("Layer 2: Response received.")
             content = response.choices[0].message.content.strip()
-            
-            # Parse JSON
-            data = json.loads(content)
+
+            # Parse JSON（带容错）
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                # 尝试提取第一个 JSON 对象
+                match = re.search(r"\{[\s\S]*\}", content)
+                if match:
+                    try:
+                        data = json.loads(match.group(0))
+                    except Exception as e:
+                        raise e
+                else:
+                    raise
             
             # Combine thoughts for UI display
             full_thought = (
@@ -549,7 +574,8 @@ IMPORTANT: Output ONLY valid JSON. No markdown code blocks, no explanation text 
         except json.JSONDecodeError as e:
             log(f"Layer 2 JSON Parse Error: {e}")
             log(f"Raw response: {content}")
-            return f"System Error: JSON parse failed - {str(e)[:100]}", ""
+            # 作为降级：直接返回原始文本作为回复，避免整个流程中断
+            return content, ""
         except Exception as e:
             log(f"Layer 2 Error: {e}")
             import traceback
@@ -633,6 +659,7 @@ def main():
         "amount": "Rp 1.250.000",
         "due_date": "2025-12-17",
         "current_time": "2025-12-17",
+        "DPD": 0,
         "gender": "Male",
         "age": "30",
         "frenquency_borrow":"often",
@@ -645,6 +672,26 @@ def main():
     except:
         st.sidebar.error("Invalid JSON in Profile")
         customer_profile = default_profile
+
+    # 计算并写入 DPD（Days Past Due），规则：DPD = (current_time - due_date) 天数
+    dpd_value = None
+    try:
+        due_dt = datetime.datetime.strptime(customer_profile.get("due_date", ""), "%Y-%m-%d").date()
+        curr_dt = datetime.datetime.strptime(customer_profile.get("current_time", ""), "%Y-%m-%d").date()
+        dpd_value = (curr_dt - due_dt).days
+    except Exception:
+        dpd_value = None
+
+    if dpd_value is not None:
+        customer_profile["DPD"] = dpd_value
+    else:
+        # 若解析失败，保留原始 DPD 或设为 None
+        customer_profile["DPD"] = customer_profile.get("DPD", None)
+
+    # 在侧边栏展示 DPD，并提示 DPD>=0 必须当天闭环还款
+    st.sidebar.metric("DPD(天)", "未知" if customer_profile["DPD"] is None else f"{customer_profile['DPD']} 天")
+    if isinstance(customer_profile.get("DPD"), int) and customer_profile["DPD"] >= 0:
+        st.sidebar.warning("DPD≥0：要求客户当天闭环还款（必须今天落实：全额，或部分+今天时间点，或符合条件的当天展期）。")
 
     # History Logs
     st.sidebar.subheader("History Logs")
@@ -795,10 +842,17 @@ def main():
                     memory_context = st.session_state.memory.get_memory_context()
                     layer2 = Layer2Executor(config)
                     # Layer2 now receives memory_context for awareness of history
+                    # 根据 DPD 加强初始执行指令：DPD≥0 必须当天闭环
+                    opening_instruction = (
+                        "Start the conversation naturally. If there's history with the customer, acknowledge it and continue. If new customer, introduce yourself and explain your role."
+                    )
+                    if isinstance(customer_profile.get("DPD"), int) and customer_profile["DPD"] >= 0:
+                        opening_instruction += " Also, DPD≥0: ensure a same-day repayment closure (full payment, or partial + a specific time today, or, if eligible, same-day extension)."
+
                     opening_response, thought = layer2.execute(
                         full_strategy_output, 
                         [], 
-                        "Start the conversation naturally. If there's history with the customer, acknowledge it and continue. If new customer, introduce yourself and explain your role.",
+                        opening_instruction,
                         history_logs,
                         memory_context  # NEW: Pass memory context so Layer2 knows the history
                     )

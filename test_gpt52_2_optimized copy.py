@@ -17,8 +17,8 @@ MODEL_PROVIDERS = {
         "models": ["gpt-4o", "gpt-4o-mini", "o1-mini"]
     },
     "Baidu ERNIE": {
-        "base_url": "https://qianfan.baidubce.com/v2",
-        "api_key": "bce-v3/ALTAK-IlAGWrpPIFAMJ3g8kbD4I/f17c0a909b891c89b0dce53d913448d86a87bad9",
+        "base_url": os.getenv("BAIDU_BASE_URL", "https://qianfan.baidubce.com/v2"),
+        "api_key": os.getenv("BAIDU_API_KEY"),
         "models": ["ernie-4.5-turbo-32k",]
     }
 }
