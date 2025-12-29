@@ -40,6 +40,8 @@ class MemoryLayer:
             "ability_score": "",
             "reason_detail": "",
             "unresolved_obstacles": [],
+            # 拒绝历史（每次拒绝的详细记录）
+            "refusal_history": [],  # 列表，每项为 {"timestamp": "HH:MM:SS", "type": "no_ability|refuse|delay", "reason": "具体理由"}
             # 历史分析结果
             "history_summary": "",
             "history_broken_promises": 0,
@@ -97,98 +99,143 @@ class MemoryLayer:
         if intent == 0:
             self.memory["payment_refusals"] += 1
         
-        # ========== 第二步：能力评估 ==========
-        if "全" in user_msg and ("还" in user_msg or "支付" in user_msg):
-            self.memory["ability_score"] = "full"
-        elif "部分" in user_msg or "一点" in user_msg or "一些" in user_msg or "先" in user_msg:
-            self.memory["ability_score"] = "partial"
-        elif "没钱" in user_msg or "无力" in user_msg or "没办法" in user_msg:
-            self.memory["ability_score"] = "zero"
-        
-        # ========== 第三步：原因分类 ==========
-        if "失业" in user_msg or "没工作" in user_msg or "收入" in user_msg or "裁员" in user_msg:
-            self.memory["reason_category"] = "unemployment"
-        elif "生病" in user_msg or "医疗" in user_msg or "健康" in user_msg or "住院" in user_msg:
-            self.memory["reason_category"] = "illness"
-        elif "忘记" in user_msg or "忘了" in user_msg or "没想起" in user_msg:
-            self.memory["reason_category"] = "forgot"
-        elif "拒绝" in user_msg or "不想" in user_msg or "拖延" in user_msg or "不配合" in user_msg:
-            self.memory["reason_category"] = "malicious_delay"
-        else:
-            self.memory["reason_category"] = "other"
-        
-        # ========== 第四步：具体理由（累积新增拒绝/理由片段） ==========
-        # 原逻辑仅在 reason_detail 为空时记录一次，导致后续新的拒绝理由未被加入。
-        # 调整为：当本轮意图判断为不还（intent == 0）且消息长度足够时，追加最新理由片段（去重，限长）。
-        if len(user_msg) > 5:
-            snippet = user_msg.strip()[:100]
-            if intent == 0:
-                existing = self.memory.get("reason_detail", "")
-                if existing:
-                    if snippet not in existing:
-                        # 使用分号分隔并限制总长度，避免无限增长
-                        self.memory["reason_detail"] = (existing + "；" + snippet)[:500]
-                else:
-                    self.memory["reason_detail"] = snippet
-        
-        # ========== 第五步：未解决障碍 ==========
-        obstacle_keywords = {
-            "开车": "正在开车",
-            "忙": "正在忙碌",
-            "会议": "在开会",
-            "睡觉": "正在睡觉",
-            "孩子": "带孩子",
-            "病": "身体不适",
-            "手机": "手机问题",
-            "网络": "网络问题"
-        }
-        for kw, obstacle in obstacle_keywords.items():
-            if kw in user_msg and obstacle not in self.memory["unresolved_obstacles"]:
-                self.memory["unresolved_obstacles"].append(obstacle)
-        
-        # ========== 第六步：收敛性信息提取（时间、金额、类型、展期）==========
-        import re
-        from datetime import datetime, timedelta
-        
-        # 日期识别（明天/后天/12月30日/30号等）
-        if "明天" in user_msg:
-            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-            self.memory["payment_date_confirmed"] = tomorrow
-        elif "后天" in user_msg:
-            day_after = (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d')
-            self.memory["payment_date_confirmed"] = day_after
-        elif re.search(r'(\d{1,2})[月号日]', user_msg):
-            date_match = re.search(r'(\d{1,2})[月号日]', user_msg)
-            self.memory["payment_date_confirmed"] = f"2025-12-{date_match.group(1)}"
-        elif re.search(r'(\d{4}[-/年]\d{1,2}[-/月]\d{1,2})', user_msg):
-            # 完整日期格式
-            date_match = re.search(r'(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})', user_msg)
-            if date_match:
-                self.memory["payment_date_confirmed"] = f"{date_match.group(1)}-{date_match.group(2).zfill(2)}-{date_match.group(3).zfill(2)}"
-        
-        # 金额识别
-        if "全额" in user_msg or "全部" in user_msg or "所有" in user_msg:
-            self.memory["payment_type_confirmed"] = "full"
-            self.memory["payment_amount_confirmed"] = "全额"
-            self.memory["has_ability_confirmed"] = True
-        elif "部分" in user_msg or "一部分" in user_msg or "先还" in user_msg:
-            self.memory["payment_type_confirmed"] = "partial"
-            # 尝试提取具体数字
-            amount_match = re.search(r'(\d+)', user_msg)
-            if amount_match:
-                self.memory["payment_amount_confirmed"] = amount_match.group(1)
-        
-        # 能力确认（有钱/可以还）
-        if "有钱" in user_msg or "可以还" in user_msg or "能还" in user_msg or "会还" in user_msg:
-            self.memory["has_ability_confirmed"] = True
-        elif "没钱" in user_msg or "钱不够" in user_msg or "没有钱" in user_msg:
-            self.memory["has_ability_confirmed"] = False
-        
-        # 展期请求
-        if "展期" in user_msg or "延期" in user_msg or "推迟" in user_msg or "宽限" in user_msg:
-            self.memory["extension_requested"] = True
+        # ========== 第二步到第五步：LLM 智能提取（能力评估、原因分类、具体理由、障碍） ==========
+        self._extract_with_llm(user_msg)
         
         log(f"Memory updated - Intent:{intent}, Date:{self.memory['payment_date_confirmed']}, Amount:{self.memory['payment_amount_confirmed']}, Type:{self.memory['payment_type_confirmed']}")
+    
+    def _extract_with_llm(self, user_msg: str):
+        """
+        使用 LLM 智能提取：能力评估、原因分类、具体理由、障碍、日期、金额、付款方式、展期
+        """
+        system_prompt = """你是信息提取专家。根据用户的话语，智能提取以下所有信息：
+
+1. ability_score: 用户还钱的能力
+   - "full": 用户有充足能力还全额
+   - "partial": 用户只能部分还钱
+   - "zero": 用户目前完全没有能力还钱
+
+2. reason_category: 无法还钱的主要原因类别
+   - "unemployment": 失业/收入问题
+   - "illness": 生病/健康问题
+   - "forgot": 忘记
+   - "malicious_delay": 拒绝/故意拖延
+   - "other": 其他原因
+
+3. reason_detail: 用户给出的具体理由或障碍描述(80字以内的摘要)
+
+4. obstacles: 用户提到的当前障碍或困难(列表，例如：["正在开车", "手机没电"])
+
+5. payment_date: 用户承诺的具体还款日期（格式：YYYY-MM-DD，如无则空字符串）
+   - 识别"明天""后天""12月30日""下周一"等相对/绝对日期
+   - 根据当前日期推算为完整日期
+
+6. payment_amount: 用户承诺的还款金额（如"5000"、"全额"、"一部分"，如无则空字符串）
+
+7. payment_type: 付款类型
+   - "full": 用户表示会还全额
+   - "partial": 用户表示只能还部分
+   - "": 未明确
+
+8. extension_requested: 用户是否请求展期/延期/推迟还款
+   - true: 是
+   - false: 否
+
+必须返回严格的 JSON 格式，例如：
+{
+  "ability_score": "partial",
+  "reason_category": "unemployment",
+  "reason_detail": "最近失业，还在找工作中，下周有面试",
+  "obstacles": ["正在忙碌", "手机问题"],
+  "payment_date": "2025-12-31",
+  "payment_amount": "5000",
+  "payment_type": "partial",
+  "extension_requested": false
+}
+
+只输出 JSON，不要其他文字。"""
+        
+        try:
+            result = self.llm_caller(
+                user_msg,
+                system_prompt=system_prompt,
+                json_mode=True
+            )
+            data = json.loads(result)
+            
+            # 1. 更新能力评估
+            ability = data.get("ability_score", "")
+            if ability in ["full", "partial", "zero"]:
+                self.memory["ability_score"] = ability
+                # 同步更新 has_ability_confirmed
+                if ability == "full" or ability == "partial":
+                    self.memory["has_ability_confirmed"] = True
+                elif ability == "zero":
+                    self.memory["has_ability_confirmed"] = False
+            
+            # 2. 更新原因分类
+            reason = data.get("reason_category", "")
+            if reason in ["unemployment", "illness", "forgot", "malicious_delay", "other"]:
+                self.memory["reason_category"] = reason
+            
+            # 3. 累积更新具体理由（去重）
+            reason_detail = data.get("reason_detail", "")
+            if reason_detail:
+                existing = self.memory.get("reason_detail", "")
+                if existing:
+                    if reason_detail not in existing:
+                        # 使用分号分隔，限制总长度
+                        self.memory["reason_detail"] = (existing + "；" + reason_detail)[:500]
+                else:
+                    self.memory["reason_detail"] = reason_detail
+                
+                # ======== 新增：记录到拒绝历史 ========
+                # 根据能力和意图判断拒绝类型
+                refusal_type = "delay"  # 默认延迟
+                if ability == "zero":
+                    refusal_type = "no_ability"  # 无能力还款
+                elif self.memory.get("intent_to_pay_today") == 0:
+                    refusal_type = "refuse"  # 拒绝还款
+                
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                refusal_entry = {
+                    "timestamp": timestamp,
+                    "type": refusal_type,
+                    "reason": reason_detail[:100]  # 截断到 100 字
+                }
+                self.memory["refusal_history"].append(refusal_entry)
+                log(f"Refusal recorded: {refusal_entry}")
+            
+            # 4. 累积更新障碍列表（去重）
+            obstacles = data.get("obstacles", [])
+            if isinstance(obstacles, list):
+                for obstacle in obstacles:
+                    if obstacle not in self.memory["unresolved_obstacles"]:
+                        self.memory["unresolved_obstacles"].append(obstacle)
+            
+            # 5. 更新还款日期（仅在之前未确认时）
+            payment_date = data.get("payment_date", "")
+            if payment_date and not self.memory.get("payment_date_confirmed"):
+                self.memory["payment_date_confirmed"] = payment_date
+            
+            # 6. 更新还款金额（仅在之前未确认时）
+            payment_amount = data.get("payment_amount", "")
+            if payment_amount and not self.memory.get("payment_amount_confirmed"):
+                self.memory["payment_amount_confirmed"] = payment_amount
+            
+            # 7. 更新付款方式
+            payment_type = data.get("payment_type", "")
+            if payment_type in ["full", "partial"] and not self.memory.get("payment_type_confirmed"):
+                self.memory["payment_type_confirmed"] = payment_type
+            
+            # 8. 更新展期请求
+            extension = data.get("extension_requested", False)
+            if extension:
+                self.memory["extension_requested"] = True
+            
+            log(f"LLM extraction completed - ability:{ability}, reason:{reason}, date:{payment_date}, amount:{payment_amount}, type:{payment_type}, extension:{extension}")
+        except Exception as e:
+            log(f"LLM extraction error: {e}")
     
     def parse_history_summary(self, history_text: str):
         """
@@ -676,6 +723,28 @@ def main():
             # 障碍
             if memory_dict.get('unresolved_obstacles'):
                 st.write(f"**待解决**: {', '.join(memory_dict['unresolved_obstacles'])}")
+            
+            # ======== 拒绝历史展示 ========
+            refusal_hist = memory_dict.get('refusal_history', [])
+            if refusal_hist:
+                st.divider()
+                st.markdown("**🚫 拒绝还款历史**")
+                
+                # 拒绝类型标签颜色映射
+                type_labels = {
+                    "no_ability": "💰 无能力",
+                    "refuse": "✋ 明确拒绝",
+                    "delay": "⏰ 延迟/拖延"
+                }
+                
+                # 按时间逆序显示（最新的在前）
+                for entry in reversed(refusal_hist):
+                    refusal_type = entry.get("type", "delay")
+                    timestamp = entry.get("timestamp", "")
+                    reason = entry.get("reason", "")
+                    
+                    type_label = type_labels.get(refusal_type, "未知")
+                    st.caption(f"**{timestamp}** | {type_label}\n{reason}")
             
             # ======== 新增：收敛性进度显示 ========
             st.divider()

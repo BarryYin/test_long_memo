@@ -190,13 +190,30 @@ def build_critic_system_prompt() -> str:
 你必须检测用户的以下行为,并通过 memory_write 更新计数器:
 
 1. **拒付行为检测** (payment_refusals):
-   当用户在 DPD>=0 时明确拒绝"今天还款",包括但不限于:
+   当用户在 DPD>=0 时以任何理由拒绝或无法"今天还款",包括但不限于:
+   
+   **明确拒绝类**:
    - "今天没钱" / "今天不能付" / "今天付不了"
    - "明天还" / "下周还" / "等工资发了再说"
    - "现在没办法" / "暂时还不了"
+   - "我拒绝还" / "我不想还"
+   
+   **障碍类但实质拒绝**（如用户反复强调同一个借口，阻止今天还款）:
+   - "银行卡掉了，无法转账" → 表明今天无法还款
+   - "手机掉了，无法进行还款" → 表明今天无法还款
+   - "在开会，等下再说" → 延迟还款（拒绝今天闭环）
+   - "正在忙，稍后处理" → 延迟还款（拒绝今天闭环）
+   
+   **重复借口**（用户在2轮以上对话中使用同一个理由拒绝还款）:
+   - 第一轮："银行卡掉了"
+   - 第二轮："是的，卡还没找到，没办法转账"
+   - 第三轮："对，还是因为卡掉了，无法还"
+   → 这是重复拒绝，计数器 +1
    
    检测到后,在 memory_write 中设置:
    {{"payment_refusals": memory_state.payment_refusals + 1}}
+   
+   **重要**：只要用户在DPD>=0时无法/拒绝"今天完成还款"，无论理由是什么，都应增加payment_refusals。
 
 2. **失约行为检测** (broken_promises):
    当用户之前承诺了还款(在对话历史或 history_summary 中),但本轮对话中:
@@ -212,11 +229,18 @@ def build_critic_system_prompt() -> str:
 
 【增强检测逻辑 - 触发 ESCALATE_TO_META 的条件】
 
-4. **死循环检测**:
-   如果用户在最近2-3轮对话中重复使用同一个借口(如连续说"没钱"、"忙"等),且没有提供新的信息:
+4. **死循环检测 + 自动增加拒付次数**:
+   如果用户在最近2-3轮对话中重复使用同一个借口(如连续说"银行卡掉了"、"手机掉了"、"没钱"等),且没有提供新的信息:
    - 设置 reason_codes: ["dead_loop_detected"]
+   - 在 memory_write 中增加 payment_refusals: {{"payment_refusals": memory_state.payment_refusals + 1}}
    - decision 应为 ESCALATE_TO_META
-   - decision_reason 中说明检测到的重复模式
+   - decision_reason 中说明检测到的重复模式，以及自动增加了拒付次数
+   
+   例：用户在第1、2、3、4轮都说"银行卡掉了"
+   → 识别到死循环
+   → payment_refusals += 1
+   → Stage 自动提升（例如 Stage2 → Stage3）
+   → 策略变为更强硬的催收
 
 5. **意图跳变检测**:
    如果用户的意图突然改变(如从"没钱"突然变成"想办延期",或从"明天还"变成"申请减免"):
@@ -240,6 +264,64 @@ def build_critic_system_prompt() -> str:
 
 你必须从对话中提取以下关键信息,并写入 memory_write:
 
+**✅ 必须执行的步骤：**
+- 每次用户回复时，检查是否包含以下任何信息：
+  1. 用户提到了不能或有困难还钱的原因？→ 写入 `reason_category` 和 `reason_detail`
+  2. 用户提到了具体的障碍（如工具缺失、时间冲突等）？→ 写入 `unresolved_obstacles`
+  3. 用户表达了还钱的能力程度？→ 写入 `ability_score`
+  
+**⚠️ 常见错误（必须避免）：**
+- ❌ 错误：Critic 在 `decision_reason` 中提到了信息，但没有写入 `memory_write`
+- ✅ 正确：Critic 同时在 `decision_reason` 中说明发现了什么，并在 `memory_write` 中记录数据
+
+**例子：**
+用户说："我的银行卡掉了，所以现在没法转账，但我后天工资会发，那时候就能还你。"
+
+你应该输出：
+```json
+{{
+  "decision": "ADAPT_WITHIN_STRATEGY",
+  "decision_reason": "用户提到具体障碍（银行卡丢失）和未来还款时间。需要：1) 确认卡片是否能补办 2) 确认后天是否确实能还 3) 询问是否有替代还款方式",
+  "reason_codes": [],
+  "progress_events": ["obstacle_detected: 银行卡丢失", "future_promise_detected: 后天工资"],
+  "missing_slots": ["补办卡时间", "后天具体还款时间", "替代还款方式"],
+  "micro_edits_for_executor": {{"ask_style": "open", "tone": "polite"}},
+  "memory_write": {{
+    "reason_category": "other",
+    "reason_detail": "银行卡丢失，无法现在转账，但后天工资发放后能还",
+    "unresolved_obstacles": ["银行卡丢失"],
+    "ability_score": "partial",
+    "payment_refusals": 1
+  }},
+  "risk_flags": []
+}}
+```
+
+**例子2：用户反复说同一个借口（死循环）**
+用户在第1轮说"银行卡掉了"
+用户在第2轮说"是的，卡还没找到"
+用户在第3轮说"还是没有卡，无法转账"
+
+你应该输出：
+```json
+{{
+  "decision": "ESCALATE_TO_META",
+  "decision_reason": "⚠️ 死循环检测：用户在3轮对话中反复强调'银行卡掉了'这同一个理由，无法提供解决方案或替代方式，实质是在拒绝今天还款。自动增加拒付次数 payment_refusals += 1。建议提升催收强度。",
+  "reason_codes": ["dead_loop_detected"],
+  "progress_events": ["repeating_excuse_detected: 银行卡丢失"],
+  "missing_slots": ["替代还款方式", "卡片补办进度"],
+  "micro_edits_for_executor": {{"ask_style": "open", "tone": "polite_firm"}},
+  "memory_write": {{
+    "reason_category": "other",
+    "reason_detail": "银行卡丢失，无法现在转账，但后天工资发放后能还",
+    "unresolved_obstacles": ["银行卡丢失"],
+    "ability_score": "zero",
+    "payment_refusals": 1
+  }},
+  "risk_flags": ["repeating_excuse"]
+}}
+```
+
 8. **reason_category** (用户不还款的原因分类):
    - "unemployment", "illness", "forgot", "malicious_delay", "other"
    
@@ -254,6 +336,17 @@ def build_critic_system_prompt() -> str:
     - 提取用户提到的阻碍还款的**具体行为/场景动作**。
     - 示例: ["正在带孩子", "正在开车", "手机没电了"]
 
+【关键：memory_write 必须包含以下内容】
+你必须在每次有新信息时将其写入 memory_write。示例：
+{{
+  "memory_write": {{
+    "reason_category": "forgot",  # 如果用户提到原因，必须分类
+    "reason_detail": "银行卡掉了，无法转账",  # 用户提到的具体理由
+    "unresolved_obstacles": ["银行卡丢失"],  # 用户提到的具体障碍
+    "ability_score": "full"  # 如果能判断能力，也要写
+  }}
+}}
+
 输出必须是严格JSON,且只输出JSON。格式如下:
 {{
   "decision": "CONTINUE" | "ADAPT_WITHIN_STRATEGY" | "ESCALATE_TO_META" | "HANDOFF",
@@ -267,14 +360,15 @@ def build_critic_system_prompt() -> str:
     "tone": "polite" | "polite_firm" | "firm",
     "language": "zh" | "id"
   }},
-  "memory_write": {{"key": "value"}},
+  "memory_write": {{"reason_category": "", "reason_detail": "", "unresolved_obstacles": [], "ability_score": ""}},
   "risk_flags": ["flag1"]
 }}
 """
 
 
 def build_meta_system_prompt() -> str:
-    return f"""你是元策略生成器(Meta / Controller)。
+        # 注意: 此处不要使用 f-string, 避免 JSON 花括号被格式化错误
+        return """你是元策略生成器(Meta / Controller)。
 输入:memory_state, critic_result, recent_dialogue, history_summary。
 输出:更新后的strategy_card(严格JSON)。
 
@@ -301,12 +395,12 @@ def build_meta_system_prompt() -> str:
 
 **Step 2: 根据用户回答,动态分支**
 - 如果用户给出合理原因且确实无法全额:
-  * 评估是否符合展期条件(extension_eligible=true, broken_promises<2, payment_refusals<2)
-  * 如果符合 → 引导展期(今天完成申请)
-  * 如果不符合 → 跳到Step 3
+    * 评估是否符合展期条件(extension_eligible=true, broken_promises<2, payment_refusals<2)
+    * 如果符合 → 引导展期(今天完成申请)
+    * 如果不符合 → 跳到Step 3
 - 如果用户态度恶劣或重复借口:
-  * 提高压力等级
-  * 直接进入二元收敛:"今天能还还是不能还?"
+    * 提高压力等级
+    * 直接进入二元收敛:"今天能还还是不能还?"
 
 **Step 3: 协商部分还款(今天)**
 - 问用户今天能还多少
@@ -351,33 +445,110 @@ def build_meta_system_prompt() -> str:
 
 【策略输出要求】
 
-在strategy_card中体现完整流程:
+在strategy_card中体现完整流程和具体压力措施:
 
-1. **today_kpi**: 列出完整的步骤序列,如:
-   ["step1_try_full_payment", "step2_explore_reasons_and_sources", "step3_assess_extension_or_partial", "step4_confirm_today_action"]
+1. **today_kpi**: 列出完整的步骤序列和具体压力措施,如:
+     - Stage2示例: ["step1_try_full_payment", "step2_explore_reasons", "step3_warning_credit_impact", "step4_negotiate_partial_today"]
+     - Stage3示例: ["step1_acknowledge_obstacle", "step2_force_binary_decision", "step3_escalate_warning_notice", "step4_mention_emergency_contact"]
+     - 注意：每一步都要包含具体的压力措施名称，不只是流程步骤
 
-2. **allowed_actions**: 包含所有可能用到的动作,如:
-   ["ask_full_payment", "ask_reasons", "explore_fund_sources", "offer_extension_if_eligible", "negotiate_partial_today", "confirm_time", "process_notice"]
+2. **allowed_actions**: 包含所有可能用到的具体动作,并按照压力强度排序:
+     - Stage2示例: ["ask_full_payment", "ask_reasons", "explore_fund_sources", "mention_credit_impact", "offer_extension_if_eligible", "negotiate_partial_today", "confirm_time"]
+     - Stage3示例: ["binary_can_pay_today", "mention_credit_blacklist", "mention_emergency_contact_involvement", "process_notice", "explore_alternative_payment"]
+     - Stage4示例: ["final_notice", "mention_third_party_collection", "mention_social_media_contact", "mention_workplace_contact"]
 
-3. **pressure_level**: 根据Stage设置合适的压力等级
+3. **pressure_level**: 根据Stage设置:
+     - Stage0-1: "polite"
+     - Stage2: "polite_firm"
+     - Stage3: "firm"
+     - Stage4: "firm"
 
-4. **params**: 设置流程控制参数,如:
-   {{"conversation_flow": "multi_step", "current_step": 1, "allow_extension": true/false}}
+4. **params**: 设置流程控制和压力参数:
+     {{
+         "conversation_flow": "multi_step",
+         "pressure_tactics": ["specific_tactic_1", "specific_tactic_2"],  # 具体的压力手段
+         "allow_extension": true/false,
+         "allow_partial": true/false,
+         "current_stage_pressure_level": 1-10  # 10级压力策略的具体等级
+     }}
 
-5. **notes**: 说明当前对话进展和下一步重点
+5. **notes**: 说明当前对话进展、下一步重点和具体压力措施:
+     - 例："用户多次拒绝，已升级到Stage3。建议：1)明确告知信用黑名单后果 2)提及紧急联系人 3)给出最后48小时期限"
 
-只输出strategy_card JSON,不要任何解释文本。格式如下:
-{{
-  "strategy_id": "str",
-  "stage": "Stage0" | "Stage1" | "Stage2" | "Stage3" | "Stage4",
-  "today_kpi": ["step1", "step2", "step3"],
-  "pressure_level": "polite" | "polite_firm" | "firm",
-  "allowed_actions": ["action1", "action2", "action3"],
-  "guardrails": ["rule1"],
-  "escalation_actions_allowed": {{"action_name": boolean}},
-  "params": {{}},
-  "notes": "optional notes"
-}}
+【关键：pressure_level 与 10级压力策略对应关系】
+
+stage_to_pressure_tactics 映射表：
+
+**Stage0-1 (polite - 压力等级1-3)**:
+- 等级1：会员等级提升 → 话术："按时还款会获得良好的信用记录,提升您的会员等级"
+- 等级2：额度提升 → 话术："会提升您的贷款额度和笔数"
+- 等级3：还款折扣 → 话术："今天还款可以获得还款折扣优惠"
+
+**Stage2 (polite_firm - 压力等级4-6)**:
+- 等级4：信用分影响 → 话术："逾期会影响您的信用分,降低贷款额度"
+- 等级5：合作终止警告 → 话术："后续贷款会很困难,我们可能会停止与您的合作"
+- 等级6：黑名单警告 → 话术："可能被拉入黑名单,不只是在我们这里,在其他平台也无法借款"
+
+**Stage3 (firm - 压力等级7-8)**:
+- 等级7：紧急联系人警告 → 话术："我们可能需要与您的紧急联系人沟通,让他们协助您还款"
+- 等级8：工作单位联系警告 → 话术："可能需要联系您工作的单位,与您的领导沟通了解您的经济状况"
+
+**Stage4 (firm - 压力等级9-10)**:
+- 等级9：社交媒体接触警告 → 话术："我们会在社交媒体上与您沟通,需要让您知道我们可以通过多种渠道找到您"
+- 等级10：第三方上门通知 → 话术："将安排第三方上门进行催收"
+
+【具体例子】
+
+**Stage3 的完整strategy_card示例**:
+```json
+{
+    "strategy_id": "Stage3_firm_escalation_with_contact_warning",
+    "stage": "Stage3",
+    "today_kpi": [
+        "step1_acknowledge_obstacle_银行卡掉了_confirm_replacement_timeline",
+        "step2_force_binary_decision_今天能还还是完全不能还",
+        "step3_escalate_credit_blacklist_warning_explain_consequences",
+        "step4_mention_emergency_contact_involvement_as_alternative_solution",
+        "step5_set_final_deadline_next_24_hours"
+    ],
+    "pressure_level": "firm",
+    "allowed_actions": [
+        "acknowledge_user_obstacle",
+        "force_binary_decision",
+        "mention_credit_blacklist",
+        "mention_emergency_contact",
+        "mention_workplace_contact_possibility",
+        "set_hard_deadline",
+        "process_notice"
+    ],
+    "guardrails": [
+        "today_only_for_dpd_ge_0",
+        "no_fake_threats",
+        "compliance_notice_only",
+        "factual_consequences_only"
+    ],
+    "escalation_actions_allowed": {
+        "mention_emergency_contact": true,
+        "mention_workplace_contact": false
+    },
+    "params": {
+        "conversation_flow": "binary_convergence",
+        "pressure_tactics": [
+            "7_emergency_contact_warning",
+            "6_blacklist_warning",
+            "acknowledge_obstacle_but_no_excuse"
+        ],
+        "current_stage_pressure_level": 7,
+        "allow_extension": false,
+        "allow_partial": false,
+        "final_deadline_hours": 24,
+        "escalation_ready": true
+    },
+    "notes": "用户银行卡掉了（障碍已确认），但多次提及同一理由。已升级到Stage3。建议话术：1)承认卡掉的问题真实存在 2)但告知必须今天找到替代方案（亲友借、其他卡等） 3)强调信用黑名单后果 4)提及可能需要联系紧急联系人 5)给出24小时最后期限"
+}
+```
+
+只输出strategy_card JSON,不要任何解释文本。格式必须包含上述所有字段,特别是**具体的pressure_tactics和step名称要包含实际措施**。
 """
 
 
@@ -390,13 +561,40 @@ def build_executor_system_prompt(org_name: str, memory_state: Dict[str, Any], st
     guardrails = strategy_card.get("guardrails", [])
     notes = strategy_card.get("notes", "")
     params = strategy_card.get("params", {})
-    
+
+    # 提取10级压力策略的具体等级
+    pressure_tactics = params.get("pressure_tactics", [])
+    pressure_level_num = params.get("current_stage_pressure_level", 1)
+
+    # 建立压力等级与具体措施的映射
+    pressure_tactics_mapping = {
+        "1_membership_upgrade": "会员等级提升 → '按时还款会获得良好的信用记录，提升您的会员等级'",
+        "2_amount_increase": "额度提升 → '会提升您的贷款额度和笔数'",
+        "3_payment_discount": "还款折扣 → '今天还款可以获得还款折扣优惠'",
+        "4_credit_score_impact": "信用分影响 → '逾期会影响您的信用分，降低贷款额度'",
+        "5_cooperation_termination_warning": "合作终止警告 → '后续贷款会很困难，我们可能会停止与您的合作'",
+        "6_blacklist_warning": "黑名单警告 → '可能被拉入黑名单，在其他平台也无法借款'",
+        "7_emergency_contact_warning": "紧急联系人警告 → '需要与您的紧急联系人沟通'",
+        "8_workplace_contact_warning": "工作单位联系警告 → '可能需要联系您的工作单位'",
+        "9_social_media_contact": "社交媒体接触警告 → '我们可以通过多种渠道与您沟通'",
+        "10_third_party_onsite_collection": "第三方上门通知 → '将安排第三方上门进行催收'",
+    }
+
+    # 生成具体的压力措施说明
+    pressure_tactics_display = "\n".join([
+        f"  - {pressure_tactics_mapping.get(tactic, tactic)}"
+        for tactic in pressure_tactics
+    ]) if pressure_tactics else "  - 暂无额外压力措施"
+
     # 将策略转换为可读的指令
     strategy_display = f"""
 【当前执行策略】
 策略ID: {strategy_card.get('strategy_id', 'Unknown')}
 阶段: {stage}
-施压等级: {pressure}
+施压等级: {pressure} (10级评分: {pressure_level_num}/10)
+
+【本次应采用的具体压力措施】:
+{pressure_tactics_display}
 
 今日目标(按顺序执行):
 {chr(10).join([f"  {i+1}. {kpi}" for i, kpi in enumerate(kpis)])}
@@ -407,9 +605,8 @@ def build_executor_system_prompt(org_name: str, memory_state: Dict[str, Any], st
 必须遵守的红线:
 {chr(10).join([f"  - {rule}" for rule in guardrails])}
 
-策略备注: {notes or "无"}
-
-流程参数: {json.dumps(params, ensure_ascii=False)}
+策略备注:
+{notes or "无"}
 """
 
     return f"""你是{org_name}负责该账户的还款跟进人员,通过WhatsApp沟通(此处用中文输出)。
@@ -435,12 +632,19 @@ def build_executor_system_prompt(org_name: str, memory_state: Dict[str, Any], st
 
 【执行要求（第一响应准则）】
 1. **优先回应**: 你现在的首要任务是针对用户最后说的那句话给出回应,在策略指引下。
-2. **严禁机械化强制**: **绝对禁止**要求用户“请回复能或不能”、“请回复1或2”或“请只回答是或否”。这种话术会暴露你是机器人。你应当通过自然的问句（如：“那咱们就定在今天下午两点，可以吗？”）来达成确认。
-3. **策略融合**: 在回应完客户后，顺势将对话引向【今日目标】中的下一步。
+2. **严禁机械化强制**: **绝对禁止**要求用户"请回复能或不能"、"请回复1或2"。应通过自然问句如"那咱们就定在今天下午两点，可以吗？"来达成确认。
+3. **策略融合**: 在回应完客户后，顺势将对话引向【今日目标】中的下一步。当需要采取压力措施时，自然地融入话术，不能生硬。
 4. **简洁**: 每次只说一件事。
 5. **不暴露身份**: 不提"我是AI"或"我是系统"。
 
-现在，基于策略和 **recent_dialogue 中的用户最新消息**，给出你的回复。
+【关键例子】
+当需要"等级7：紧急联系人警告"时：
+✅ 正确："我们希望不打扰您的紧急联系人，但如果今天无法解决这件事，我们就需要与他们沟通。您能理解吗？"
+
+当需要"等级6：黑名单警告"时：
+✅ 正确："如果这笔债继续拖欠，我们就需要将您的信息报送到金融黑名单，这会影响您在所有平台的贷款申请。您现在能帮我们避免这种结果吗？"
+
+现在，基于策略和最新消息，给出你的回复。
 """
 
 
@@ -728,70 +932,169 @@ def ensure_strategy_card(memory_state: Dict[str, Any], strategy_card: Optional[D
     pr = int(memory_state.get("payment_refusals", 0))
     stage = memory_state.get("stage", calculate_stage(dpd, bp, pr))
 
-    # Stage-specific strategy design
+    # Stage-specific strategy design with EXPLICIT pressure tactics
     if stage == "Stage0":
-        # 提前期:建立关系,正向激励
+        # 提前期:建立关系,正向激励 (压力等级1-3)
         sc = StrategyCard(
             strategy_id=f"{stage}_relationship_building",
             stage=stage,
-            today_kpi=["step1_build_trust", "step2_remind_benefits"],
+            today_kpi=[
+                "step1_build_trust_and_introduce_benefits",
+                "step2_explain_incentive_programs",
+                "step3_confirm_payment_method_and_remind_due_date"
+            ],
             pressure_level="polite",
-            allowed_actions=["inform_benefits", "offer_discount", "confirm_payment_method"],
-            guardrails=["no_pressure", "positive_tone_only"],
+            allowed_actions=["inform_benefits", "offer_discount", "confirm_payment_method", "ask_preferred_contact_time"],
+            guardrails=["no_pressure", "positive_tone_only", "focus_on_relationship"],
             escalation_actions_allowed={},
-            params={"focus": "relationship", "tone": "friendly"}
+            params={
+                "conversation_flow": "relationship_building",
+                "pressure_tactics": ["1_membership_upgrade", "2_amount_increase", "3_payment_discount"],
+                "current_stage_pressure_level": 1,
+                "focus": "relationship",
+                "tone": "friendly"
+            },
+            notes="提前期,客户正常还款。建议话术：强调按时还款的好处(会员等级、额度提升、折扣优惠)。不涉及任何压力措施。"
         )
     elif stage == "Stage1":
-        # 到期日:温和提醒 + 摸底
+        # 到期日:温和提醒 + 摸底 (压力等级3-4)
         sc = StrategyCard(
             strategy_id=f"{stage}_gentle_reminder",
             stage=stage,
-            today_kpi=["step1_remind_due_today", "step2_ask_payment_plan"],
+            today_kpi=[
+                "step1_remind_due_today_with_positivity",
+                "step2_ask_payment_plan_and_ability",
+                "step3_mention_benefits_of_full_payment_today"
+            ],
             pressure_level="polite",
-            allowed_actions=["ask_pay_today", "offer_extension_if_eligible", "ask_payment_time"],
-            guardrails=["today_only_for_dpd_ge_0", "no_threats"],
+            allowed_actions=["ask_pay_today", "ask_payment_time", "offer_extension_if_eligible", "ask_reasons", "explore_fund_sources"],
+            guardrails=["today_only_for_dpd_ge_0", "no_threats", "gentle_tone"],
             escalation_actions_allowed={},
-            params={"focus": "information_gathering", "probe_ability": True}
+            params={
+                "conversation_flow": "information_gathering",
+                "pressure_tactics": ["3_payment_discount", "4_credit_impact_mention"],
+                "current_stage_pressure_level": 3,
+                "probe_ability": True,
+                "focus": "information_gathering"
+            },
+            notes="到期日。建议话术：1)提醒今天是到期日 2)询问是否能今天还款 3)如果有困难,探索原因和资金来源 4)强调按时还款的好处。还未涉及强压力。"
         )
     elif stage == "Stage2":
-        # 轻度逾期:施压 + 收敛
+        # 轻度逾期:施压 + 收敛 (压力等级4-6)
         sc = StrategyCard(
             strategy_id=f"{stage}_light_pressure",
             stage=stage,
-            today_kpi=["step1_ask_full_payment", "step2_explore_reasons", "step3_negotiate_partial"],
+            today_kpi=[
+                "step1_ask_full_payment_today_firmly",
+                "step2_explore_reasons_and_fund_sources",
+                "step3_mention_credit_impact_and_blacklist_warning",
+                "step4_negotiate_partial_payment_with_deadline"
+            ],
             pressure_level="polite_firm",
-            allowed_actions=["ask_pay_today", "forced_choice_amount_time", "mention_credit_impact"],
-            guardrails=["today_only_for_dpd_ge_0", "no_fake_threats", "no_humiliation"],
+            allowed_actions=[
+                "ask_pay_today", 
+                "forced_choice_amount_time", 
+                "mention_credit_impact",
+                "mention_blacklist_warning",
+                "explore_fund_sources",
+                "offer_extension_if_eligible",
+                "negotiate_partial_today",
+                "confirm_time"
+            ],
+            guardrails=["today_only_for_dpd_ge_0", "no_fake_threats", "no_humiliation", "factual_consequences_only"],
             escalation_actions_allowed={},
-            params={"focus": "convergence", "allow_partial": True, "credit_warning": True}
+            params={
+                "conversation_flow": "convergence",
+                "pressure_tactics": ["4_credit_score_impact", "5_cooperation_termination_warning", "6_blacklist_warning"],
+                "current_stage_pressure_level": 5,
+                "allow_partial": True,
+                "allow_extension": True if not memory_state.get("broken_promises", 0) >= 2 else False,
+                "credit_warning": True
+            },
+            notes="逾期1-5天,有未履行承诺。建议话术：1)确认能否全额还款,若不能探索原因 2)提及逾期会影响信用分、降低额度 3)警告可能被拉入黑名单 4)如符合条件,可提及展期 5)最后协商今天的部分还款 6)设定明确的还款时间。"
         )
     elif stage == "Stage3":
-        # 中度逾期:强施压 + 二元收敛
+        # 中度逾期:强施压 + 二元收敛 (压力等级7-8)
         sc = StrategyCard(
-            strategy_id=f"{stage}_firm_pressure",
+            strategy_id=f"{stage}_firm_escalation",
             stage=stage,
-            today_kpi=["step1_force_today_decision", "step2_escalate_warning"],
+            today_kpi=[
+                "step1_acknowledge_customer_obstacle_if_exists",
+                "step2_force_binary_decision_today_or_never",
+                "step3_escalate_blacklist_and_credit_damage_warning",
+                "step4_mention_emergency_contact_involvement",
+                "step5_set_final_deadline_24_48_hours"
+            ],
             pressure_level="firm",
-            allowed_actions=["binary_can_pay_today", "mention_blacklist", "contact_emergency_contact_warning"],
-            guardrails=["today_only_for_dpd_ge_0", "no_fake_threats", "compliance_notice_only"],
+            allowed_actions=[
+                "binary_can_pay_today", 
+                "mention_credit_blacklist",
+                "mention_emergency_contact_warning",
+                "mention_workplace_contact_possibility",
+                "set_hard_deadline",
+                "process_notice",
+                "acknowledge_obstacle_but_emphasize_solution"
+            ],
+            guardrails=[
+                "today_only_for_dpd_ge_0", 
+                "no_fake_threats", 
+                "compliance_notice_only", 
+                "factual_consequences_only",
+                "no_humiliation"
+            ],
             escalation_actions_allowed={"mention_emergency_contact": True},
-            params={"focus": "binary_convergence", "allow_partial": False, "escalation_warning": True}
+            params={
+                "conversation_flow": "binary_convergence",
+                "pressure_tactics": ["6_blacklist_warning", "7_emergency_contact_warning", "8_workplace_contact_warning"],
+                "current_stage_pressure_level": 7,
+                "allow_partial": False,
+                "allow_extension": False,
+                "final_deadline_hours": 24,
+                "escalation_ready": True
+            },
+            notes="逾期5-20天或多次失约/拒付。建议话术：1)承认用户的困境(如银行卡掉了)但强调必须找替代方案 2)强制二元选择「今天能还还是完全不能还」 3)详细说明被拉入黑名单的后果(所有平台都无法借款) 4)提及可能需要联系紧急联系人协助 5)给出24小时最后期限 6)如果继续拒绝,告知将启动正式催收流程。"
         )
     else:  # Stage4
-        # 严重逾期:最强施压 + 流程告知
+        # 严重逾期:最强施压 + 流程告知 (压力等级9-10)
         sc = StrategyCard(
             strategy_id=f"{stage}_maximum_pressure",
             stage=stage,
-            today_kpi=["step1_final_notice", "step2_process_escalation"],
+            today_kpi=[
+                "step1_final_notice_about_debt_status",
+                "step2_escalate_third_party_collection_warning",
+                "step3_mention_social_media_and_workplace_contact",
+                "step4_process_formal_escalation_notice"
+            ],
             pressure_level="firm",
-            allowed_actions=["binary_can_pay_today", "process_notice", "mention_third_party_collection", "social_media_contact_warning"],
-            guardrails=["compliance_notice_only", "no_humiliation", "factual_consequences_only"],
+            allowed_actions=[
+                "binary_can_pay_today", 
+                "process_notice", 
+                "mention_third_party_collection",
+                "mention_social_media_contact_warning",
+                "mention_workplace_contact_warning",
+                "final_notice"
+            ],
+            guardrails=[
+                "compliance_notice_only", 
+                "no_humiliation", 
+                "factual_consequences_only",
+                "record_all_escalation_evidence"
+            ],
             escalation_actions_allowed={
                 "contact_emergency": True,
                 "contact_workplace": True if memory_state.get("sop_trigger_named_escalation") else False,
                 "social_media_mention": True if memory_state.get("sop_trigger_named_escalation") else False
             },
-            params={"focus": "formal_escalation", "allow_partial": False, "full_compliance_mode": True}
+            params={
+                "conversation_flow": "formal_escalation",
+                "pressure_tactics": ["9_social_media_contact", "10_third_party_onsite_collection"],
+                "current_stage_pressure_level": 9,
+                "allow_partial": False,
+                "allow_extension": False,
+                "full_compliance_mode": True,
+                "escalation_required": True
+            },
+            notes="严重逾期(>20天)或多次拒付。建议话术：1)明确告知已进入严重违约阶段 2)说明将启动第三方催收机构 3)提及我们有多种方式与其沟通(社交媒体、工作单位等) 4)强调这将严重影响其信用和生活 5)给出最后48小时期限 6)告知将启动法律程序。仅在获得批准(approval_id存在)时才能执行第9-10级措施。"
         )
     
     return sc.model_dump()
@@ -841,6 +1144,14 @@ def handle_turn(user_msg: str):
 
     # 2) Apply memory writes (Includes dynamic reason detection)
     new_memory = apply_memory_write(state, critic.memory_write)
+    
+    # 诊断日志
+    if critic.memory_write:
+        print(f"[DEBUG] Critic memory_write: {critic.memory_write}")
+        print(f"[DEBUG] Merged new_memory keys: {new_memory.keys()}")
+        print(f"[DEBUG] reason_detail before: {state.get('reason_detail')}")
+        print(f"[DEBUG] reason_detail after merge: {new_memory.get('reason_detail')}")
+    
     state.update(new_memory)
     
     # --- NEW: Stage 深度联动 (Stage Refresh & Force Meta) ---
@@ -986,29 +1297,50 @@ with right:
     with st.container(border=True):
         col_m1, col_m2 = st.columns(2)
         with col_m1:
-            cat = state.get('reason_category', '未知')
+            cat = state.get('reason_category', '') or '未知'
             cat_map = {
                 "unemployment": "🚫 失业/收入",
                 "illness": "🏥 疾病/健康",
                 "forgot": "❓ 忘记/疏忽",
                 "malicious_delay": "👿 恶意拖延",
-                "other": "⚙️ 其他"
+                "other": "⚙️ 其他",
+                "": "⏳ 未知"
             }
-            st.metric("原因分类", cat_map.get(cat, cat))
+            display_cat = cat_map.get(cat, cat)
+            st.metric("原因分类", display_cat)
         
         with col_m2:
-            score = state.get('ability_score', '未知')
+            score = state.get('ability_score', '') or '未知'
             score_map = {
                 "full": "✅ 有能力全额",
                 "partial": "⚠️ 仅能部分",
-                "zero": "❌ 无力还款"
+                "zero": "❌ 无力还款",
+                "": "⏳ 未知"
             }
-            st.metric("能力评估", score_map.get(score, score))
+            display_score = score_map.get(score, score)
+            st.metric("能力评估", display_score)
 
-        if state.get('reason_detail'):
-            st.info(f"**具体理由:** {state.get('reason_detail')}")
+        # 显示具体理由
+        reason_detail = state.get('reason_detail', '').strip()
+        if reason_detail:
+            st.info(f"**具体理由:** {reason_detail}")
         else:
-            st.caption("尚未确定具体理由")
+            st.caption("⏳ 尚未确定具体理由")
+        
+        # 显示待解决障碍
+        obstacles = state.get('unresolved_obstacles', [])
+        if obstacles and len(obstacles) > 0:
+            obstacles_str = " | ".join(obstacles)
+            st.warning(f"**待解决障碍:** {obstacles_str}")
+        
+        # 诊断面板（DEBUG用）
+        with st.expander("🔍 诊断：Memory 原始数据", expanded=False):
+            st.code(json.dumps({
+                "reason_category": state.get('reason_category', ''),
+                "reason_detail": state.get('reason_detail', ''),
+                "ability_score": state.get('ability_score', ''),
+                "unresolved_obstacles": state.get('unresolved_obstacles', [])
+            }, ensure_ascii=False, indent=2), language="json")
 
     # --- 📥 导入历史记录 ---
     with st.expander("📥 导入过往记录 (智能解析)", expanded=False):
@@ -1052,7 +1384,27 @@ with right:
     # Auto-refresh stage
     state["stage"] = calculate_stage(dpd, bp, pr)
     risk_score = dpd * 10 + bp * 15 + pr * 20
-    st.caption(f"当前阶段: **{state['stage']}** (风险分: {risk_score})")
+    
+    # 显示风险等级及变化
+    st.divider()
+    col_risk1, col_risk2, col_risk3 = st.columns(3)
+    with col_risk1:
+        st.metric("🚩 DPD风险", dpd, f"得分: {dpd * 10}")
+    with col_risk2:
+        st.metric("🔗 失约风险", bp, f"得分: {bp * 15}")
+    with col_risk3:
+        st.metric("✋ 拒付风险", pr, f"得分: {pr * 20}")
+    
+    # 显示总体阶段和风险分
+    stage_color_map = {
+        "Stage0": "🟢",
+        "Stage1": "🟡", 
+        "Stage2": "🟠",
+        "Stage3": "🔴",
+        "Stage4": "⚫"
+    }
+    stage_emoji = stage_color_map.get(state['stage'], "❓")
+    st.markdown(f"{stage_emoji} **当前阶段: {state['stage']}** | 总风险分: **{risk_score}**")
 
     # --- 🧠 策略展示 ---
     st.divider()
@@ -1118,6 +1470,28 @@ with right:
         st.markdown(f"决策: :{color}[**{decision}**]")
         st.info(f"理由: {critic.get('decision_reason')}")
         if critic.get("risk_flags"):
-            st.warning(f"🚩 风险信号: {critic.get('risk_flags')}")
+            st.warning(f"🚩 风险信号: {', '.join(critic.get('risk_flags', []))}")
+        
+        # 新增：展示 Critic 提取的 memory_write
+        memory_write = critic.get("memory_write", {})
+        if memory_write:
+            st.divider()
+            st.markdown("**📝 Critic 提取的记忆更新:**")
+            with st.expander("查看 memory_write 内容", expanded=True):
+                st.code(json.dumps(memory_write, ensure_ascii=False, indent=2), language="json")
+                
+                # 诊断：检查拒付次数是否被正确增加
+                if "payment_refusals" in memory_write:
+                    new_pr_value = memory_write.get("payment_refusals")
+                    st.caption(f"⚠️ Critic 建议将拒付次数 (payment_refusals) 更新为: **{new_pr_value}**")
+                    st.caption(f"💡 提示：你可以在上面的'本次拒付次数'中手动调整，或者让系统自动应用 Critic 的建议")
+                
+                # 检查是否有reason_detail被成功提取
+                if "reason_detail" in memory_write and memory_write["reason_detail"]:
+                    state_reason = state.get("reason_detail", "")
+                    if memory_write["reason_detail"] in state_reason or state_reason in memory_write["reason_detail"] or not state_reason:
+                        st.success(f"✅ reason_detail 已应用到 state: {memory_write['reason_detail']}")
+                    else:
+                        st.warning(f"⚠️ 数据可能不匹配。Critic 提取: {memory_write['reason_detail']} | State: {state_reason}")
     else:
         st.caption("等待下一轮质检结果...")
