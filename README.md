@@ -21,6 +21,53 @@ The system operates using a three-layer agentic workflow:
     *   Evaluates the "Probability of Repayment" (High, Medium, Low) after every customer input.
     *   Triggers a strategy update if the probability drops to "Low".
 
+## 🔄 Operational Logic
+
+The following flowchart illustrates the interaction between the user and the three agent layers:
+
+```mermaid
+graph TD
+    Start([Start Session]) --> Init{Strategy Exists?}
+    
+    %% Initialization Phase
+    Init -- No --> L1_Init[Layer 1: Generate Initial Strategy]
+    L1_Init --> L2_Open[Layer 2: Generate Opening Message]
+    L2_Open --> UserWait
+    
+    %% Interaction Loop
+    Init -- Yes --> UserWait[/Wait for User Input/]
+    UserWait --> UserInput[User Sends Message]
+    
+    %% Evaluation Phase
+    UserInput --> L3_Eval[Layer 3: Evaluate Probability]
+    L3_Eval --> CheckProb{Probability Low?}
+    
+    %% Strategy Update Phase
+    CheckProb -- Yes --> L1_Update[Layer 1: Update Strategy]
+    L1_Update --> L2_Exec
+    CheckProb -- No --> L2_Exec
+    
+    %% Execution Phase
+    L2_Exec[Layer 2: Execute Response] --> Display[Display & Log Response]
+    Display --> UserWait
+    
+    style Start fill:#f9f,stroke:#333,stroke-width:2px
+    style L1_Init fill:#e1f5fe,stroke:#01579b
+    style L1_Update fill:#e1f5fe,stroke:#01579b
+    style L2_Open fill:#fff3e0,stroke:#e65100
+    style L2_Exec fill:#fff3e0,stroke:#e65100
+    style L3_Eval fill:#e8f5e9,stroke:#1b5e20
+    style CheckProb fill:#fff9c4,stroke:#fbc02d
+```
+
+### Logic Breakdown
+1.  **Initialization**: At the start, **Layer 1** analyzes the rigid customer history to formulate a high-level strategy. **Layer 2** uses this to "break the ice".
+2.  **Monitoring**: Every time the user speaks, **Layer 3** evaluates the situation. It monitors not just *what* is said, but the *implication* on repayment probability.
+3.  **Adaptive feedback**:
+    *   If the conversation is going well (High/Medium probability), **Layer 2** continues executing the current strategy.
+    *   If the user is resistant (Low probability), **Layer 3** signals **Layer 1** to intervene. **Layer 1** then modifies the instructions for **Layer 2** (e.g., "Switch from friendly reminder to strict warning about credit score impact").
+
+
 ## ✨ Key Features
 
 *   **Interactive Chat Interface**: Real-time conversation with the agent.
