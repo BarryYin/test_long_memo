@@ -356,6 +356,16 @@ def call_llm(prompt, system_prompt="You are a helpful assistant.", json_mode=Fal
             log(f"Calling LLM... Model: {MODEL_NAME}, JSON_Mode: {json_mode}")
             response = client.chat.completions.create(**kwargs)
             log("LLM Response received.")
+            # 记录 tokens 使用情况（如可用）
+            try:
+                usage = getattr(response, "usage", None)
+                if usage:
+                    prompt_tokens = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", None))
+                    completion_tokens = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", None))
+                    total_tokens = getattr(usage, "total_tokens", None)
+                    log(f"LLM tokens - prompt:{prompt_tokens}, completion:{completion_tokens}, total:{total_tokens}")
+            except Exception as _:
+                pass
             return response.choices[0].message.content.strip()
         except Exception as e:
             log(f"LLM Error: {e}")
@@ -483,20 +493,41 @@ class Layer2Executor:
         max_history = self.config.get('max_history_messages', 10)
         trimmed_history = chat_history[-max_history:] if isinstance(chat_history, list) else []
 
+        # 过滤配置，避免在系统提示中重复嵌入体积巨大的 system_prompt
+        try:
+            filtered_config = {k: v for k, v in self.config.items() if k != 'system_prompt'}
+            filtered_config_text = json.dumps(filtered_config, ensure_ascii=False, indent=2)
+        except Exception:
+            filtered_config_text = "{}"
+
+        # 预裁剪上下文块，进一步降低长度
+        try:
+            max_len_history_logs = int(self.config.get('max_len_history_logs', 1500))
+            max_len_memory_context = int(self.config.get('max_len_memory_context', 1800))
+            max_len_strategy = int(self.config.get('max_len_strategy', 2000))
+        except Exception:
+            max_len_history_logs = 1500
+            max_len_memory_context = 1800
+            max_len_strategy = 2000
+
+        history_logs_short = (history_logs or "")[:max_len_history_logs]
+        memory_context_short = (memory_context or "")[:max_len_memory_context]
+        strategy_short = (strategy or "")[:max_len_strategy]
+
         combined_system_prompt = f"""{cleaned_base_prompt}
 
 # KEY CONTEXT (Read Carefully)
 1. **HISTORY (Last Interaction)**:
-{history_logs}
+{history_logs_short}
 
 2. **CLIENT CURRENT STATE (Memory)**:
-{memory_context}
+{memory_context_short}
 
 3. **TODAY'S STRATEGY (Your Supreme Command)**:
-{strategy}
+{strategy_short}
 
 4. **CONFIG RULES (Reference)**:
-{json.dumps(self.config, ensure_ascii=False, indent=2)}
+{filtered_config_text}
 
 # INSTRUCTIONS
 You are a professional Collection Agent - focused on **execution**, not analysis.
@@ -539,14 +570,36 @@ IMPORTANT: Output ONLY valid JSON. No markdown code blocks, no explanation text 
         messages.append({"role": "user", "content": user_input})
         
         try:
+            # 调用前粗略估算 tokens（约 4 字符 ≈ 1 token）
+            def _approx_tokens(s: str) -> int:
+                try:
+                    return max(1, len(s) // 4)
+                except Exception:
+                    return 1
+
+            approx_total = _approx_tokens(combined_system_prompt) + sum(_approx_tokens(m.get('content', '')) for m in trimmed_history) + _approx_tokens(user_input)
+            log(f"Layer2 preflight approx tokens: ~{approx_total}")
+
+            request_timeout = self.config.get('request_timeout_seconds', 40)
             log("Layer 2: Sending request to OpenAI with JSON format...")
             response = client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages,
                 temperature=0.7,
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                timeout=request_timeout
             )
             log("Layer 2: Response received.")
+            # 记录 tokens 使用情况（如可用）
+            try:
+                usage = getattr(response, "usage", None)
+                if usage:
+                    prompt_tokens = getattr(usage, "prompt_tokens", getattr(usage, "input_tokens", None))
+                    completion_tokens = getattr(usage, "completion_tokens", getattr(usage, "output_tokens", None))
+                    total_tokens = getattr(usage, "total_tokens", None)
+                    log(f"Layer2 tokens - prompt:{prompt_tokens}, completion:{completion_tokens}, total:{total_tokens}")
+            except Exception as _:
+                pass
             content = response.choices[0].message.content.strip()
 
             # Parse JSON（带容错）
